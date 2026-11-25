@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Picks up Debian's Chromium and base image security updates.
+  schedule:
+    - cron: "17 4 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: tkislan/ha-puppet
+  PUPPET_COMMIT: 8794da9d4129fe2a5d1feff1cbb3b8b18e8b7c89
+  PUBLISH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out Puppet
+        uses: actions/checkout@v7
+        with:
+          repository: balloob/home-assistant-addons
+          ref: ${{ env.PUPPET_COMMIT }}
+          path: upstream
+          persist-credentials: false
+      - name: Listen on loopback only
+        run: |
+          dir=upstream/puppet/ha-puppet
+          test "$(grep -ro --include='*.js' --include='*.mjs' --exclude='test_*' '\.listen(' "$dir" | wc -l)" -eq 1
+          test "$(grep -cx 'server.listen(port);' "$dir/http.js")" -eq 1
+          sed -i 's|^server.listen(port);$|server.listen(port, "127.0.0.1"); // Changed by tkislan/ha-puppet: loopback only|' "$dir/http.js"
+          grep -qx 'server.listen(port, "127.0.0.1"); // Changed by tkislan/ha-puppet: loopback only' "$dir/http.js"
+          cp upstream/LICENSE "$dir/LICENSE"
+      - name: Puppet version
+        id: puppet
+        run: |
+          version=$(sed -nE 's/^version: "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' upstream/puppet/config.yaml)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to Docker Hub
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: tkislan
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Image tag, labels and annotations
+        id: meta
+        uses: docker/metadata-action@v6
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=${{ steps.puppet.outputs.version }}.${{ github.run_number }}
+          labels: |
+            org.opencontainers.image.licenses=Apache-2.0
+      - name: Build, and push on main
+        uses: docker/build-push-action@v7
+        with:
+          context: upstream/puppet
+          platforms: linux/amd64
+          push: ${{ env.PUBLISH == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
